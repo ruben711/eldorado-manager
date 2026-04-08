@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -8,6 +9,131 @@ const __dirname = path.dirname(__filename);
 const ELDORADO_ORIGIN = "https://www.eldorado.gg";
 const DEFAULT_SWAGGER_HEADER = "Swager request";
 const TALKJS_ORIGIN = "https://app.talkjs.com";
+
+/** Eldorado API validates XSRF (cookie + header). Cache bootstrap per session token. */
+const xsrfCache = new Map();
+
+function tokenCacheKey(idToken) {
+  return crypto.createHash("sha256").update(idToken).digest("hex");
+}
+
+/** First name=value segment of a Set-Cookie line (before attributes). */
+function parseSetCookiePair(setCookieLine) {
+  const semi = setCookieLine.indexOf(";");
+  const first = (semi === -1 ? setCookieLine : setCookieLine.slice(0, semi)).trim();
+  const eq = first.indexOf("=");
+  if (eq <= 0) return null;
+  const name = first.slice(0, eq).trim();
+  let value = first.slice(eq + 1).trim();
+  if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+  return { name, value };
+}
+
+function isXsrfCookieName(name) {
+  return /xsrf|csrf|forgery|antiforgery|requestverification/i.test(name);
+}
+
+/**
+ * Hit Eldorado HTML with the IdToken cookie so they issue XSRF cookies; mirror browser same-origin.
+ */
+async function getEldoradoXsrfBundle(idToken) {
+  const key = tokenCacheKey(idToken);
+  const now = Date.now();
+  const ttl = 15 * 60 * 1000;
+  const hit = xsrfCache.get(key);
+  if (hit && hit.until > now) return hit.bundle;
+
+  const trimmed = idToken.trim();
+  const baseHeaders = {
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    Cookie: `__Host-EldoradoIdToken=${trimmed}`,
+    Origin: ELDORADO_ORIGIN,
+    Referer: `${ELDORADO_ORIGIN}/`,
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+  };
+
+  const tryUrls = [
+    `${ELDORADO_ORIGIN}/`,
+    `${ELDORADO_ORIGIN}/seller`,
+    `${ELDORADO_ORIGIN}/seller/dashboard`,
+  ];
+  const cookiePairs = [];
+  let xsrfHeaderVal = null;
+
+  for (const url of tryUrls) {
+    const res = await fetch(url, { headers: baseHeaders, redirect: "follow" });
+    let lines = [];
+    if (typeof res.headers.getSetCookie === "function") {
+      const sc = res.headers.getSetCookie();
+      if (Array.isArray(sc)) lines = sc;
+    }
+    if (lines.length === 0) {
+      const single = res.headers.get("set-cookie");
+      if (single) lines = [single];
+    }
+
+    for (const line of lines) {
+      const pair = parseSetCookiePair(line);
+      if (!pair || !isXsrfCookieName(pair.name)) continue;
+      cookiePairs.push(`${pair.name}=${pair.value}`);
+      try {
+        xsrfHeaderVal = decodeURIComponent(pair.value.replace(/\+/g, " "));
+      } catch {
+        xsrfHeaderVal = pair.value;
+      }
+    }
+    if (xsrfHeaderVal && cookiePairs.length) break;
+  }
+
+  const bundle =
+    xsrfHeaderVal && cookiePairs.length
+      ? { cookiePairs, xsrfHeaderVal }
+      : null;
+
+  if (bundle) xsrfCache.set(key, { until: now + ttl, bundle });
+  return bundle;
+}
+
+function buildEldoradoUpstreamHeaders(req, idToken, xsrfBundle) {
+  const headers = { ...req.headers };
+
+  delete headers.host;
+  delete headers.connection;
+  delete headers["content-length"];
+  delete headers["accept-encoding"];
+  delete headers.cookie;
+  delete headers["x-eldorado-id-token"];
+
+  // Do not send the SPA origin (e.g. onrender.com) to Eldorado — breaks CSRF / XSRF checks.
+  headers.origin = ELDORADO_ORIGIN;
+  headers.referer = `${ELDORADO_ORIGIN}/`;
+
+  for (const hn of Object.keys(headers)) {
+    const low = hn.toLowerCase();
+    if (
+      low.startsWith("sec-fetch-") ||
+      low === "sec-purpose" ||
+      low.startsWith("sec-ch-ua")
+    ) {
+      delete headers[hn];
+    }
+  }
+
+  if (idToken) {
+    const parts = [`__Host-EldoradoIdToken=${idToken}`];
+    if (xsrfBundle?.cookiePairs?.length) {
+      parts.push(...xsrfBundle.cookiePairs);
+    }
+    headers.cookie = parts.join("; ");
+    if (xsrfBundle?.xsrfHeaderVal) {
+      headers["x-xsrf-token"] = xsrfBundle.xsrfHeaderVal;
+    }
+  }
+
+  if (!headers.swagger) headers.swagger = DEFAULT_SWAGGER_HEADER;
+  return headers;
+}
 
 function getArgFlag(name) {
   return process.argv.includes(name);
@@ -20,35 +146,23 @@ function toTargetUrl(originalUrl) {
   return new URL(pathname, ELDORADO_ORIGIN);
 }
 
-function filteredRequestHeaders(req) {
-  const headers = { ...req.headers };
-
-  // Disallowed / hop-by-hop / problematic headers for proxying
-  delete headers.host;
-  delete headers.connection;
-  delete headers["content-length"];
-  delete headers["accept-encoding"];
-
-  // We control auth cookie via token header
-  delete headers.cookie;
-
-  // Ensure required swagger header exists (per swagger.json)
-  if (!headers.swagger) headers.swagger = DEFAULT_SWAGGER_HEADER;
-
-  const idToken = headers["x-eldorado-id-token"];
-  delete headers["x-eldorado-id-token"];
-  if (typeof idToken === "string" && idToken.trim()) {
-    headers.cookie = `__Host-EldoradoIdToken=${idToken.trim()}`;
-  }
-
-  return headers;
-}
-
 async function proxyToEldorado(req, res) {
   const targetUrl = toTargetUrl(req.originalUrl);
 
   const method = req.method?.toUpperCase?.() ?? "GET";
-  const headers = filteredRequestHeaders(req);
+  const rawId = req.headers["x-eldorado-id-token"];
+  const idToken = typeof rawId === "string" ? rawId.trim() : "";
+
+  let xsrfBundle = null;
+  if (idToken) {
+    try {
+      xsrfBundle = await getEldoradoXsrfBundle(idToken);
+    } catch (e) {
+      console.error("Eldorado XSRF bootstrap failed:", e?.message || e);
+    }
+  }
+
+  const headers = buildEldoradoUpstreamHeaders(req, idToken, xsrfBundle);
 
   const hasBody = !["GET", "HEAD"].includes(method) && req.body && req.body.length > 0;
   const body = hasBody ? req.body : undefined;
