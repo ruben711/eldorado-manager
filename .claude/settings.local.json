@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_Preview__preview_start",
+      "Bash(npm run:*)",
+      "WebFetch(domain:api.eldorado.io)",
+      "WebFetch(domain:www.eldorado.gg)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:support.eldorado.gg)",
+      "Bash(npx vite:*)"
+    ]
+  }
+}
